@@ -3,49 +3,89 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from sklearn.covariance import EmpiricalCovariance
 
-def balanced_risk_set_matching(df, treatment_col, covariate_cols, caliper=0.1):
+def balanced_risk_set_matching(df, treatment_col, covariate_cols, caliper=0.1, ratio=1):
     """
-    Perform Balanced Risk Set Matching.
+    Enhanced Balanced Risk Set Matching with Mahalanobis distance and proper caliper handling
     
     Parameters:
-    df (pd.DataFrame): The dataset containing treatment and covariate columns.
-    treatment_col (str): The name of the treatment column (1 for treated, 0 for control).
-    covariate_cols (list): List of covariate column names to balance.
-    caliper (float): Maximum allowed difference in propensity scores.
+    df (pd.DataFrame): Dataset containing treatment and covariates
+    treatment_col (str): Name of treatment column (binary 1/0)
+    covariate_cols (list): Covariate columns to balance
+    caliper (float): Standardized maximum distance (SD units)
+    ratio (int): Control:treated ratio (default 1:1)
     
     Returns:
-    pd.DataFrame: Matched dataset.
+    pd.DataFrame: Matched dataset with original indices
+    pd.DataFrame: Balance diagnostics report
     """
     
-    # Step 1: Standardize Covariates
-    scaler = StandardScaler()
-    df[covariate_cols] = scaler.fit_transform(df[covariate_cols])
-    
-    # Step 2: Estimate Propensity Scores
-    model = LogisticRegression()
-    model.fit(df[covariate_cols], df[treatment_col])
-    df["propensity_score"] = model.predict_proba(df[covariate_cols])[:, 1]
-    
-    # Step 3: Separate Treated and Control Groups
+    # Preprocessing
+    df = df.dropna(subset=[treatment_col] + covariate_cols).copy()
     treated = df[df[treatment_col] == 1]
     control = df[df[treatment_col] == 0]
-
-    # Step 4: Match Using Nearest Neighbor
-    nbrs = NearestNeighbors(n_neighbors=1, metric="euclidean").fit(control[["propensity_score"]])
-    distances, indices = nbrs.kneighbors(treated[["propensity_score"]])
     
-    matched_control_indices = indices.flatten()
-    matched_control = control.iloc[matched_control_indices].reset_index(drop=True)
+    if len(treated) == 0 or len(control) == 0:
+        raise ValueError("Insufficient treatment/control units")
     
-    # Apply Caliper Constraint
-    matched_control = matched_control[np.abs(matched_control["propensity_score"] - treated["propensity_score"].values) <= caliper]
+    # Standardize covariates using control group parameters
+    scaler = StandardScaler().fit(control[covariate_cols])
+    df_std = df.copy()
+    df_std[covariate_cols] = scaler.transform(df[covariate_cols])
+    
+    # Estimate propensity scores using logistic regression
+    ps_model = LogisticRegression(max_iter=1000)
+    ps_model.fit(df_std[covariate_cols], df[treatment_col])
+    df_std['ps'] = ps_model.predict_proba(df_std[covariate_cols])[:, 1]
+    
+    # Calculate Mahalanobis distance matrix
+    cov = EmpiricalCovariance().fit(control[covariate_cols]).covariance_
+    inv_cov = np.linalg.pinv(cov)
+    
+    # Create neighbor search structure
+    nbrs = NearestNeighbors(
+        n_neighbors=ratio,
+        metric='mahalanobis',
+        metric_params={'VI': inv_cov}
+    ).fit(control[covariate_cols])
+    
+    # Find matches with caliper constraint
+    distances, indices = nbrs.kneighbors(treated[covariate_cols])
+    
+    # Apply caliper in standardized units
+    valid_matches = (distances <= caliper).any(axis=1)
+    treated_matched = treated[valid_matches]
+    control_matched = control.iloc[indices[valid_matches].flatten()]
+    
+    # Create matched dataset
+    matched_df = pd.concat([
+        treated_matched,
+        control_matched.assign(matched_pair=np.repeat(treated_matched.index, ratio))
+    ]).sort_index()
+    
+    # Balance diagnostics
+    balance_report = pd.DataFrame({
+        'Variable': covariate_cols + ['ps'],
+        'StdDiff Before': calculate_std_diff(df, treatment_col, covariate_cols + ['ps']),
+        'StdDiff After': calculate_std_diff(matched_df, treatment_col, covariate_cols + ['ps'])
+    })
+    
+    return matched_df, balance_report
 
-    # Step 5: Return Matched Dataset
-    matched_df = pd.concat([treated.reset_index(drop=True), matched_control.reset_index(drop=True)], axis=0)
-    return matched_df
+def calculate_std_diff(df, treatment_col, variables):
+    means = df.groupby(treatment_col)[variables].mean()
+    stds = df.groupby(treatment_col)[variables].std()
+    return (means.loc[1] - means.loc[0]) / np.sqrt((stds.loc[1]**2 + stds.loc[0]**2)/2)
 
 # Example Usage
-# df = pd.read_csv("your_dataset.csv")
-# matched_data = balanced_risk_set_matching(df, treatment_col="treatment", covariate_cols=["age", "income", "education"])
-# print(matched_data)
+# df = pd.read_csv("your_data.csv")
+# matched_data, diagnostics = balanced_risk_set_matching(
+#     df, 
+#     treatment_col="treatment",
+#     covariate_cols=["age", "income", "education"],
+#     caliper=0.2,
+#     ratio=1
+# )
+# print("Matched Data:\n", matched_data)
+# print("\nBalance Diagnostics:\n", diagnostics)
